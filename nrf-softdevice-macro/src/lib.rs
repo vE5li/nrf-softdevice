@@ -392,7 +392,7 @@ pub fn gatt_service(args: TokenStream, item: TokenStream) -> TokenStream {
 
         if indicate {
             code_impl.extend(quote_spanned!(ch.span=>
-                fn #indicate_fn(
+                #fn_vis fn #indicate_fn(
                     &self,
                     conn: &#ble::Connection,
                     val: &#ty,
@@ -556,6 +556,7 @@ pub fn gatt_client(args: TokenStream, item: TokenStream) -> TokenStream {
     let mut code_disc_char = TokenStream2::new();
     let mut code_disc_done = TokenStream2::new();
     let mut code_event_enum = TokenStream2::new();
+    let mut code_on_hvx = TokenStream2::new();
 
     let ble = quote!(::nrf_softdevice::ble);
 
@@ -576,6 +577,8 @@ pub fn gatt_client(args: TokenStream, item: TokenStream) -> TokenStream {
         let write_fn = format_ident!("{}_write", ch.name);
         let write_wor_fn = format_ident!("{}_write_without_response", ch.name);
         let write_try_wor_fn = format_ident!("{}_try_write_without_response", ch.name);
+        let cccd_write_fn = format_ident!("{}_cccd_write", ch.name);
+        let fn_vis = ch.vis.clone();
 
         let uuid = ch.args.uuid;
         let read = ch.args.read;
@@ -637,7 +640,7 @@ pub fn gatt_client(args: TokenStream, item: TokenStream) -> TokenStream {
 
         if read {
             code_impl.extend(quote_spanned!(ch.span=>
-                async fn #read_fn(&self) -> Result<#ty, #ble::gatt_client::ReadError> {
+                #fn_vis async fn #read_fn(&self) -> Result<#ty, #ble::gatt_client::ReadError> {
                     let mut buf = [0; #ty_as_val::MAX_SIZE];
                     let len = #ble::gatt_client::read(&self.conn, self.#value_handle, &mut buf).await?;
                     Ok(#ty_as_val::from_gatt(&buf[..len]))
@@ -647,15 +650,15 @@ pub fn gatt_client(args: TokenStream, item: TokenStream) -> TokenStream {
 
         if write {
             code_impl.extend(quote_spanned!(ch.span=>
-                async fn #write_fn(&self, val: &#ty) -> Result<(), #ble::gatt_client::WriteError> {
+                #fn_vis async fn #write_fn(&self, val: &#ty) -> Result<(), #ble::gatt_client::WriteError> {
                     let buf = #ty_as_val::to_gatt(val);
                     #ble::gatt_client::write(&self.conn, self.#value_handle, buf).await
                 }
-                async fn #write_wor_fn(&self, val: &#ty) -> Result<(), #ble::gatt_client::WriteError> {
+                #fn_vis async fn #write_wor_fn(&self, val: &#ty) -> Result<(), #ble::gatt_client::WriteError> {
                     let buf = #ty_as_val::to_gatt(val);
                     #ble::gatt_client::write_without_response(&self.conn, self.#value_handle, buf).await
                 }
-                fn #write_try_wor_fn(&self, val: &#ty) -> Result<(), #ble::gatt_client::TryWriteError> {
+                #fn_vis fn #write_try_wor_fn(&self, val: &#ty) -> Result<(), #ble::gatt_client::TryWriteError> {
                     let buf = #ty_as_val::to_gatt(val);
                     #ble::gatt_client::try_write_without_response(&self.conn, self.#value_handle, buf)
                 }
@@ -685,6 +688,55 @@ pub fn gatt_client(args: TokenStream, item: TokenStream) -> TokenStream {
             code_event_enum.extend(quote_spanned!(ch.span=>
                 #case_notification(#ty),
             ));
+            code_on_hvx.extend(quote_spanned!(ch.span=>
+                if handle == self.#value_handle && type_ == ::nrf_softdevice::ble::gatt_client::HvxType::Notification {
+                    if data.len() < #ty_as_val::MIN_SIZE {
+                        return None;
+                    } else {
+                        return Some(#event_enum_name::#case_notification(#ty_as_val::from_gatt(data)));
+                    }
+                }
+            ));
+
+            if !indicate {
+                code_impl.extend(quote_spanned!(ch.span=>
+                    #fn_vis async fn #cccd_write_fn(&self, notifications: bool) -> Result<(), #ble::gatt_client::WriteError> {
+                        #ble::gatt_client::write(&self.conn, self.#cccd_handle, &[if notifications { 0x01 } else { 0x00 }, 0x00]).await
+                    }
+                ));
+            }
+        }
+
+        if indicate {
+            let case_indication = format_ident!("{}Indication", name_pascal);
+            code_event_enum.extend(quote_spanned!(ch.span=>
+                #case_indication(#ty),
+            ));
+            code_on_hvx.extend(quote_spanned!(ch.span=>
+                if handle == self.#value_handle && type_ == ::nrf_softdevice::ble::gatt_client::HvxType::Indication {
+                    if data.len() < #ty_as_val::MIN_SIZE {
+                        return None;
+                    } else {
+                        return Some(#event_enum_name::#case_indication(#ty_as_val::from_gatt(data)));
+                    }
+                }
+            ));
+
+            if !notify {
+                code_impl.extend(quote_spanned!(ch.span=>
+                    #fn_vis async fn #cccd_write_fn(&self, indications: bool) -> Result<(), #ble::gatt_client::WriteError> {
+                        #ble::gatt_client::write(&self.conn, self.#cccd_handle, &[if indications { 0x02 } else { 0x00 }, 0x00]).await
+                    }
+                ));
+            }
+        }
+
+        if indicate && notify {
+            code_impl.extend(quote_spanned!(ch.span=>
+                #fn_vis async fn #cccd_write_fn(&self, indications: bool, notifications: bool) -> Result<(), #ble::gatt_client::WriteError> {
+                    #ble::gatt_client::write(&self.conn, self.#cccd_handle, &[if indications { 0x02 } else { 0x00 } | if notifications { 0x01 } else { 0x00 }, 0x00]).await
+                }
+            ));
         }
     }
 
@@ -700,7 +752,14 @@ pub fn gatt_client(args: TokenStream, item: TokenStream) -> TokenStream {
         }
 
         impl #ble::gatt_client::Client for #struct_name {
-            //type Event = #event_enum_name;
+            type Event = #event_enum_name;
+
+            fn on_hvx(&self, _conn: &::nrf_softdevice::ble::Connection, type_: ::nrf_softdevice::ble::gatt_client::HvxType, handle: u16, data: &[u8]) -> Option<Self::Event> {
+                use #ble::gatt_client::Client;
+
+                #code_on_hvx
+                None
+            }
 
             fn uuid() -> #ble::Uuid {
                 #uuid
